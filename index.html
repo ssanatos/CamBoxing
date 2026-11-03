@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>카메라 복싱</title>
+<style>
+:root{--bg:#14110f;--chalk:#f3efe6;--red:#e5372c;--tape:#f6c21a;--dim:#9b9488}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--chalk);overflow:hidden;
+ font-family:"Pretendard Variable",Pretendard,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif}
+body{display:flex;align-items:center;justify-content:center}
+video{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+canvas{display:block;background:#000}
+#menu{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;
+ padding:24px;text-align:center;background:rgba(20,17,15,.88)}
+#menu.hide{display:none}
+h1{margin:0;font-size:clamp(40px,9vw,84px);font-weight:900;letter-spacing:-.03em;line-height:1}
+#msg{margin:0;min-height:1.6em;font-size:18px;color:var(--chalk);max-width:30em;line-height:1.5}
+.row{display:flex;gap:10px}
+button{font:inherit;font-weight:800;color:var(--chalk);background:transparent;border:3px solid var(--chalk);
+ border-radius:6px;padding:10px 22px;font-size:18px;cursor:pointer}
+button.on{background:var(--tape);border-color:var(--tape);color:#14110f}
+button:focus-visible{outline:3px solid var(--tape);outline-offset:3px}
+#go{background:var(--red);border-color:var(--red);font-size:24px;padding:14px 56px}
+#go:disabled{opacity:.5;cursor:wait}
+.tip{margin:0;font-size:14px;color:var(--dim);max-width:34em;line-height:1.6}
+</style>
+</head>
+<body>
+<video id="v" playsinline muted></video>
+<canvas id="c"></canvas>
+<div id="menu">
+  <h1>카메라 복싱</h1>
+  <p id="msg">샌드백을 치고, 날아오는 공은 피하세요. 웹캠만 있으면 됩니다.</p>
+  <div class="row" id="diffs">
+    <button data-d="easy">하</button><button data-d="mid" class="on">중</button><button data-d="hard">상</button>
+  </div>
+  <button id="go">시작</button>
+  <p class="tip">상반신이 화면에 다 보이게 카메라에서 1.5~2m 떨어져 서세요. 밝은 곳이 좋아요.<br>
+  빨간 불이 깜박이면 공이 옵니다. 직선은 옆으로, 훅은 숙여서 피하세요.</p>
+</div>
+<script type="module">
+import {PoseLandmarker,FilesetResolver} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $=id=>document.getElementById(id);
+const v=$('v'),cv=$('c'),ctx=cv.getContext('2d');
+let W=640,H=360,pose=null,diff='mid',state='idle';
+// th: 펀치로 인정할 최소 속도(어깨너비/초), fly: 공이 날아오는 시간(초), gap: 공 사이 간격(초)
+const DIFF={easy:{th:1.6,fly:1.5,gap:[2.8,4]},mid:{th:2.2,fly:1.1,gap:[2,3]},hard:{th:2.8,fly:0.8,gap:[1.2,2.1]}};
+const LEAD=.7, GAME=60;
+
+let score,combo,hits,dodged,balls,tEnd,tStart,nextBall,lastHit,shake=0,flash=0,floats=[];
+let P=null,lastSeen=0,ball=null,lastVT=-1;
+const hands=[{sp:0,cool:0},{sp:0,cool:0}];
+const bag={a:0,av:0,glow:0};
+
+/* ---------- 소리 ---------- */
+let ac=null;
+function beep(f,d=.08,type='square',g=.06){if(!ac)return;const o=ac.createOscillator(),k=ac.createGain();
+ o.type=type;o.frequency.value=f;k.gain.value=g;k.gain.exponentialRampToValueAtTime(.001,ac.currentTime+d);
+ o.connect(k).connect(ac.destination);o.start();o.stop(ac.currentTime+d)}
+
+/* ---------- 초기화 ---------- */
+function fit(){
+ const ar=(v.videoWidth||16)/(v.videoHeight||9);let w=innerWidth,h=w/ar;
+ if(h>innerHeight){h=innerHeight;w=h*ar}
+ cv.width=W=Math.round(w);cv.height=H=Math.round(h);cv.style.width=w+'px';cv.style.height=h+'px';
+}
+addEventListener('resize',fit);
+const msg=t=>$('msg').textContent=t;
+
+async function init(){
+ const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:1280,height:720},audio:false});
+ v.srcObject=stream;await v.play();fit();
+ msg('동작 인식 모델 불러오는 중…');
+ const fs=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+ const model="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+ const mk=d=>PoseLandmarker.createFromOptions(fs,{baseOptions:{modelAssetPath:model,delegate:d},runningMode:'VIDEO',numPoses:1});
+ try{pose=await mk('GPU')}catch(e){pose=await mk('CPU')}
+ requestAnimationFrame(loop);
+}
+
+/* ---------- 자세 읽기 ---------- */
+function readPose(){
+ const r=pose.detectForVideo(v,performance.now());const L=r.landmarks[0];if(!L)return;
+ const m=i=>({x:(1-L[i].x)*W,y:L[i].y*H});
+ const n=m(0),ls=m(11),rs=m(12),sw=Math.hypot(ls.x-rs.x,ls.y-rs.y);
+ if(sw<W*.04)return;
+ const t=performance.now()/1000;
+ [15,16].forEach((id,i)=>{const w=m(id),h=hands[i],z=L[id].z*W;
+  if(h.t!==undefined){const dt=Math.max(.016,t-h.t);
+   const s2=Math.hypot(w.x-h.x,w.y-h.y)/dt/sw, sz=Math.max(0,h.z-z)/dt/sw; // 화면 안 속도 + 카메라 쪽 전진 속도
+   h.sp=h.sp*.4+Math.hypot(s2,sz)*.6}
+  h.x=w.x;h.y=w.y;h.z=z;h.t=t});
+ P={n,ls,rs,sw};lastSeen=t;
+}
+
+/* ---------- 게임 흐름 ---------- */
+function startGame(){
+ score=combo=hits=dodged=balls=0;floats=[];ball=null;lastHit=0;
+ tStart=performance.now()/1000;state='count';$('menu').classList.add('hide');beep(440,.1);
+}
+function endGame(){
+ state='over';
+ let best=0;try{best=+localStorage.getItem('camboxing_best_'+diff)||0;if(score>best){best=score;localStorage.setItem('camboxing_best_'+diff,best)}}catch(e){}
+ msg(`점수 ${score} · 펀치 ${hits}번 · 회피 ${dodged}/${balls} · 최고 ${best}`);
+ $('go').textContent='다시 하기';$('go').disabled=false;$('menu').classList.remove('hide');beep(220,.4,'sawtooth');
+}
+$('diffs').onclick=e=>{const d=e.target.dataset.d;if(!d)return;diff=d;[...$('diffs').children].forEach(b=>b.classList.toggle('on',b===e.target))};
+$('go').onclick=async()=>{
+ if(!ac)ac=new (window.AudioContext||window.webkitAudioContext)();
+ if(pose){startGame();return}
+ $('go').disabled=true;msg('카메라 켜는 중…');
+ try{await init();$('go').disabled=false;startGame()}
+ catch(e){console.error(e);$('go').disabled=false;msg('카메라나 모델을 불러오지 못했어요. 주소창의 카메라 권한을 허용하고 새로고침해 주세요.')}
+};
+
+/* ---------- 샌드백 ---------- */
+const bagC=()=>{const L=H*.5;return{x:W*.5+Math.sin(bag.a)*L,y:H*.55}};
+const bagBox=()=>({bw:H*.11,bh:H*.25});
+
+function hitTest(t){
+ if(!P||state!=='play')return;
+ const bc=bagC(),{bw,bh}=bagBox(),th=DIFF[diff].th,pad=P.sw*.15;
+ hands.forEach(h=>{
+  if(h.x===undefined||t<h.cool||t-lastSeen>.3)return;
+  if(Math.abs(h.x-bc.x)<bw+pad&&Math.abs(h.y-bc.y)<bh+pad&&h.sp>th){
+   h.cool=t+.35;if(t-lastHit>3)combo=0;lastHit=t;
+   const pts=Math.round((10+Math.min(15,(h.sp-th)*5))*(1+Math.min(combo,20)*.05));
+   score+=pts;combo++;hits++;
+   bag.av+=(bc.x-h.x>=0?1:-1)*Math.min(3,h.sp*.4);bag.glow=1;
+   floats.push({x:h.x,y:h.y,txt:'+'+pts,col:'#f6c21a',t});beep(180+Math.min(300,h.sp*40),.07,'triangle',.15);
+  }});
+}
+
+/* ---------- 날아오는 공 ---------- */
+function launch(t){
+ const type=Math.random()<.5?'straight':'hook';
+ ball={type,side:Math.random()<.5?-1:1,t0:t,tx:P.n.x,ty:P.n.y,fly:DIFF[diff].fly};
+ beep(type==='hook'?660:880,.12);
+}
+function resolve(t){
+ const b=ball;ball=null;nextBall=t+DIFF[diff].gap[0]+Math.random()*(DIFF[diff].gap[1]-DIFF[diff].gap[0]);
+ if(!P||t-lastSeen>.6)return;
+ balls++;
+ const dx=Math.abs(P.n.x-b.tx),dy=P.n.y-b.ty;
+ const ok=b.type==='hook'?dy>P.sw*.45:(dx>P.sw*.7||dy>P.sw*.55);
+ if(ok){dodged++;score+=20;combo++;lastHit=t;floats.push({x:P.n.x,y:P.n.y-P.sw,txt:'회피! +20',col:'#8fe388',t});beep(1040,.1,'triangle',.12)}
+ else{score=Math.max(0,score-15);combo=0;shake=1;flash=1;floats.push({x:P.n.x,y:P.n.y-P.sw,txt:'맞았다 -15',col:'#e5372c',t});beep(120,.25,'sawtooth',.15)}
+}
+function drawBall(t){
+ const b=ball,e=t-b.t0;
+ if(e<LEAD){ // 경고등
+  if(Math.floor(e*10)%2===0){
+   const lx=b.type==='straight'?W/2:(b.side>0?W*.94:W*.06),ly=b.type==='straight'?H*.1:H*.4;
+   ctx.fillStyle=b.type==='straight'?'#e5372c':'#f6c21a';ctx.beginPath();ctx.arc(lx,ly,H*.04,0,7);ctx.fill();
+   ctx.shadowColor=ctx.fillStyle;ctx.shadowBlur=30;ctx.fill();ctx.shadowBlur=0}
+  return}
+ const u=Math.min(1,(e-LEAD)/b.fly);
+ const r=b.type==='hook'?W*(.03+.04*u):W*(.012+.08*u*u);
+ const sx=b.side>0?W+r:-r;
+ for(let k=3;k>=0;k--){ // 잔상
+  const uu=Math.max(0,u-k*.04);
+  const x=b.type==='hook'?sx+(b.tx-sx)*Math.pow(uu,1.5):b.tx+Math.sin(e*25)*P.sw*.03, y=b.ty;
+  ctx.globalAlpha=k?.18:1;ctx.fillStyle='#e5372c';ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.fill();
+  if(!k){ctx.fillStyle='rgba(255,255,255,.35)';ctx.beginPath();ctx.arc(x-r*.3,y-r*.3,r*.3,0,7);ctx.fill()}
+ }
+ ctx.globalAlpha=1;
+ if(diff!=='hard'){ctx.fillStyle='#f3efe6';ctx.font=`800 ${H*.05}px sans-serif`;ctx.textAlign='center';
+  ctx.fillText(b.type==='hook'?'훅 — 숙이세요':'직선 — 옆으로 피하세요',W/2,H*.2)}
+ if(u>=1)resolve(t);
+}
+
+/* ---------- 그리기 ---------- */
+function drawBag(){
+ const L=H*.5,{bw,bh}=bagBox();
+ ctx.save();ctx.translate(W*.5,0);ctx.rotate(-bag.a);
+ ctx.strokeStyle='#cfcabd';ctx.lineWidth=4;ctx.beginPath();ctx.moveTo(-bw*.5,0);ctx.lineTo(0,L-bh*.55);ctx.lineTo(bw*.5,0);ctx.stroke();
+ ctx.translate(0,L*1.1-L+H*.05);
+ ctx.fillStyle='#b3261e';ctx.strokeStyle=bag.glow>.1?`rgba(246,194,26,${bag.glow})`:'#3a0d0a';ctx.lineWidth=bag.glow>.1?8:4;
+ const box=()=>{ctx.beginPath();ctx.roundRect?ctx.roundRect(-bw,-bh*.55,bw*2,bh*1.1,bw*.35):ctx.rect(-bw,-bh*.55,bw*2,bh*1.1)};
+ box();ctx.fill();ctx.stroke();
+ ctx.fillStyle='#f6c21a';ctx.fillRect(-bw,-bh*.12,bw*2,bh*.16);
+ ctx.fillStyle='rgba(255,255,255,.14)';ctx.fillRect(-bw*.7,-bh*.5,bw*.25,bh);
+ ctx.restore();
+}
+function drawPlayer(){
+ if(!P||performance.now()/1000-lastSeen>.6)return;
+ ctx.strokeStyle='rgba(243,239,230,.55)';ctx.lineWidth=3;ctx.beginPath();ctx.arc(P.n.x,P.n.y,P.sw*.38,0,7);ctx.stroke();
+ hands.forEach(h=>{if(h.x===undefined)return;const fast=h.sp>DIFF[diff].th;
+  ctx.fillStyle='#e5372c';ctx.strokeStyle=fast?'#f6c21a':'#f3efe6';ctx.lineWidth=fast?6:3;
+  ctx.beginPath();ctx.arc(h.x,h.y,P.sw*.22,0,7);ctx.fill();ctx.stroke()});
+}
+function hud(t){
+ ctx.textAlign='left';ctx.fillStyle='#f3efe6';ctx.font=`900 ${H*.09}px sans-serif`;ctx.fillText(score,W*.03,H*.11);
+ if(combo>1){ctx.fillStyle='#f6c21a';ctx.font=`800 ${H*.045}px sans-serif`;ctx.fillText(combo+' 콤보',W*.03,H*.17)}
+ const left=Math.max(0,Math.ceil(tEnd-t));ctx.textAlign='right';ctx.fillStyle=left<=10?'#e5372c':'#f3efe6';
+ ctx.font=`900 ${H*.09}px sans-serif`;ctx.fillText(left,W*.97,H*.11);
+}
+
+/* ---------- 메인 루프 ---------- */
+let lastT=0;
+function loop(now){
+ requestAnimationFrame(loop);
+ const t=now/1000,dt=Math.min(.05,t-lastT);lastT=t;
+ if(v.readyState<2)return;
+ if(v.currentTime!==lastVT){lastVT=v.currentTime;readPose()}
+ bag.av+=(-18*Math.sin(bag.a)-1.6*bag.av)*dt;bag.a+=bag.av*dt;bag.glow=Math.max(0,bag.glow-dt*3);
+ shake=Math.max(0,shake-dt*3);flash=Math.max(0,flash-dt*2.5);
+
+ ctx.save();
+ if(shake>0)ctx.translate((Math.random()-.5)*shake*H*.03,(Math.random()-.5)*shake*H*.03);
+ ctx.translate(W,0);ctx.scale(-1,1);ctx.drawImage(v,0,0,W,H);ctx.setTransform(1,0,0,1,0,0);
+ if(shake>0)ctx.translate((Math.random()-.5)*shake*H*.03,(Math.random()-.5)*shake*H*.03);
+ ctx.fillStyle='rgba(20,17,15,.3)';ctx.fillRect(0,0,W,H);
+ drawBag();
+
+ if(state==='count'){
+  const c=3-Math.floor(t-tStart);
+  ctx.fillStyle='#f3efe6';ctx.textAlign='center';ctx.font=`900 ${H*.3}px sans-serif`;ctx.fillText(c>0?c:'파이트!',W/2,H*.35);
+  if(!P){ctx.font=`800 ${H*.05}px sans-serif`;ctx.fillStyle='#f6c21a';ctx.fillText('상반신이 보이도록 뒤로 물러나세요',W/2,H*.9)}
+  if(t-tStart>=3.6){state='play';tEnd=t+GAME;nextBall=t+1.5;beep(660,.15)}
+ }
+ else if(state==='play'){
+  hitTest(t);
+  if(!ball&&P&&t-lastSeen<.3&&t>nextBall)launch(t);
+  if(ball)drawBall(t);
+  hud(t);
+  if(t-lastSeen>.6){ctx.fillStyle='#f6c21a';ctx.textAlign='center';ctx.font=`800 ${H*.05}px sans-serif`;ctx.fillText('몸이 인식되지 않아요',W/2,H*.92)}
+  if(t>=tEnd)endGame();
+ }
+ drawPlayer();
+ floats=floats.filter(f=>t-f.t<1);
+ floats.forEach(f=>{const a=t-f.t;ctx.globalAlpha=1-a;ctx.fillStyle=f.col;ctx.textAlign='center';
+  ctx.font=`900 ${H*.06}px sans-serif`;ctx.fillText(f.txt,f.x,f.y-a*H*.1)});
+ ctx.globalAlpha=1;
+ if(flash>0){ctx.fillStyle=`rgba(229,55,44,${flash*.45})`;ctx.fillRect(0,0,W,H)}
+ ctx.restore();
+}
+</script>
+</body>
+</html>
